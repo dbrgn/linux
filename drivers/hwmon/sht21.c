@@ -25,14 +25,23 @@
 #include <linux/mutex.h>
 #include <linux/device.h>
 #include <linux/jiffies.h>
+#include <linux/delay.h>
 
-/* I2C command bytes */
-#define SHT21_TRIG_T_MEASUREMENT_HM  0xe3
-#define SHT21_TRIG_RH_MEASUREMENT_HM 0xe5
+/* I2C commands */
+static const char sht21_trig_t_measurement_nh[] = { 0xf3 };
+static const char sht21_trig_rh_measurement_nh[] = { 0xf5 };
 #define SHT21_READ_SNB_CMD1 0xFA
 #define SHT21_READ_SNB_CMD2 0x0F
 #define SHT21_READ_SNAC_CMD1 0xFC
 #define SHT21_READ_SNAC_CMD2 0xC9
+
+/* I2C lengths */
+#define SHT21_CMD_LENGTH 1
+#define SHT21_RESPONSE_LENGTH 3
+
+/* Max waiting times in ms at max resolution, datasheet table 7 */
+#define SHT21_WAIT_T 85
+#define SHT21_WAIT_RH 29
 
 /**
  * struct sht21 - SHT21 device specific data
@@ -93,6 +102,7 @@ static inline int sht21_rh_ticks_to_per_cent_mille(int ticks)
 static int sht21_update_measurements(struct device *dev)
 {
 	int ret = 0;
+	unsigned char buf[SHT21_RESPONSE_LENGTH];
 	struct sht21 *sht21 = dev_get_drvdata(dev);
 	struct i2c_client *client = sht21->client;
 
@@ -103,22 +113,60 @@ static int sht21_update_measurements(struct device *dev)
 	 * maximum two measurements per second at 12bit accuracy shall be made.
 	 */
 	if (time_after(jiffies, sht21->last_update + HZ / 2) || !sht21->valid) {
-		ret = i2c_smbus_read_word_swapped(client,
-						  SHT21_TRIG_T_MEASUREMENT_HM);
-		if (ret < 0)
+		/*
+		 * Read from the SHT21 in non blocking mode
+		 * (no clock stretching).
+		 */
+
+		/* Trigger temperature measurement */
+		ret = i2c_master_send(client,
+				      sht21_trig_t_measurement_nh,
+				      SHT21_CMD_LENGTH);
+		if (ret != SHT21_CMD_LENGTH) {
+			dev_err(dev, "failed to send command: %d\n", ret);
+			ret = -EIO;
 			goto out;
-		sht21->temperature = sht21_temp_ticks_to_millicelsius(ret);
-		ret = i2c_smbus_read_word_swapped(client,
-						  SHT21_TRIG_RH_MEASUREMENT_HM);
-		if (ret < 0)
+		}
+		msleep(SHT21_WAIT_T);
+
+		/* Read temperature data */
+		ret = i2c_master_recv(client, buf, sizeof(buf));
+		if (ret != SHT21_RESPONSE_LENGTH) {
+			dev_err(dev, "failed to read values: %d\n", ret);
+			ret = -EIO;
 			goto out;
-		sht21->humidity = sht21_rh_ticks_to_per_cent_mille(ret);
+		}
+		sht21->temperature = sht21_temp_ticks_to_millicelsius(
+			(buf[0] << 8) | buf[1]
+		);
+
+		/* Trigger humidity measurement */
+		ret = i2c_master_send(client,
+				      sht21_trig_rh_measurement_nh,
+				      SHT21_CMD_LENGTH);
+		if (ret != SHT21_CMD_LENGTH) {
+			dev_err(dev, "failed to send command: %d\n", ret);
+			ret = -EIO;
+			goto out;
+		}
+		msleep(SHT21_WAIT_RH);
+
+		/* Read humidity data */
+		ret = i2c_master_recv(client, buf, sizeof(buf));
+		if (ret != SHT21_RESPONSE_LENGTH) {
+			dev_err(dev, "failed to read values: %d\n", ret);
+			ret = -EIO;
+			goto out;
+		}
+		sht21->humidity = sht21_rh_ticks_to_per_cent_mille(
+			(buf[0] << 8) | buf[1]
+		);
+
 		sht21->last_update = jiffies;
 		sht21->valid = 1;
 	}
 out:
 	mutex_unlock(&sht21->lock);
-
 	return ret >= 0 ? 0 : ret;
 }
 
@@ -268,13 +316,6 @@ static int sht21_probe(struct i2c_client *client,
 	struct device *dev = &client->dev;
 	struct device *hwmon_dev;
 	struct sht21 *sht21;
-
-	if (!i2c_check_functionality(client->adapter,
-				     I2C_FUNC_SMBUS_WORD_DATA)) {
-		dev_err(&client->dev,
-			"adapter does not support SMBus word transactions\n");
-		return -ENODEV;
-	}
 
 	sht21 = devm_kzalloc(dev, sizeof(*sht21), GFP_KERNEL);
 	if (!sht21)
